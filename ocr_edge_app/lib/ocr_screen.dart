@@ -240,7 +240,22 @@ class _OCRScreenState extends State<OCRScreen> {
                 child: _isCameraInitialized
                     ? Stack(
                         children: [
-                          CameraPreview(_cameraController!),
+                          FittedBox(
+                            fit: BoxFit.cover,
+                            clipBehavior: Clip.hardEdge,
+                            child: SizedBox(
+                              width:
+                                  _cameraController!
+                                      .value
+                                      .previewSize
+                                      ?.height ??
+                                  1,
+                              height:
+                                  _cameraController!.value.previewSize?.width ??
+                                  1,
+                              child: CameraPreview(_cameraController!),
+                            ),
+                          ),
                           if (_isProcessing)
                             Container(
                               color: Colors.black54,
