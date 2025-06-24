@@ -3,13 +3,10 @@
 #
 
 list(APPEND FLUTTER_PLUGIN_LIST
-  permission_handler_windows
-  printing
-  url_launcher_windows
+  tflite_flutter_helper
 )
 
 list(APPEND FLUTTER_FFI_PLUGIN_LIST
-  pdfrx
 )
 
 set(PLUGIN_BUNDLED_LIBRARIES)

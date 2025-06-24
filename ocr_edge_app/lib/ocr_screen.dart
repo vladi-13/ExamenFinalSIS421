@@ -1,15 +1,58 @@
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart';
-import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:convert';
 import 'main.dart';
+import 'package:tflite_flutter/tflite_flutter.dart';
+import 'package:tflite_flutter_helper/tflite_flutter_helper.dart';
+import 'package:image/image.dart' as img;
+
+// Lista de clases reconocidas por el modelo (0-9, A-Z)
+const List<String> ocrClasses = [
+  '0',
+  '1',
+  '2',
+  '3',
+  '4',
+  '5',
+  '6',
+  '7',
+  '8',
+  '9',
+  'A',
+  'B',
+  'C',
+  'D',
+  'E',
+  'F',
+  'G',
+  'H',
+  'I',
+  'J',
+  'K',
+  'L',
+  'M',
+  'N',
+  'O',
+  'P',
+  'Q',
+  'R',
+  'S',
+  'T',
+  'U',
+  'V',
+  'W',
+  'X',
+  'Y',
+  'Z',
+];
 
 class OCRScreen extends StatefulWidget {
   final List<CameraDescription> cameras;
@@ -25,12 +68,13 @@ class _OCRScreenState extends State<OCRScreen> {
   bool _isCameraInitialized = false;
   bool _isProcessing = false;
   String _extractedText = '';
-  final TextRecognizer _textRecognizer = TextRecognizer();
+  Interpreter? _interpreter;
 
   @override
   void initState() {
     super.initState();
     _initializeCamera();
+    _loadModel();
   }
 
   Future<void> _initializeCamera() async {
@@ -63,7 +107,8 @@ class _OCRScreenState extends State<OCRScreen> {
 
     _cameraController = CameraController(
       widget.cameras[0],
-      ResolutionPreset.high,
+      ResolutionPreset.medium,
+      enableAudio: false,
     );
 
     try {
@@ -86,101 +131,103 @@ class _OCRScreenState extends State<OCRScreen> {
     }
   }
 
-  Future<void> _captureAndProcessImage() async {
-    if (!_isCameraInitialized || _isProcessing) return;
-
-    setState(() {
-      _isProcessing = true;
-      _extractedText = '';
-    });
-
+  Future<void> _loadModel() async {
     try {
-      final XFile picture = await _cameraController!.takePicture();
-      await _processImageForOCR(picture.path);
+      _interpreter = await Interpreter.fromAsset(
+        'model_hybrid_quantized.tflite',
+      );
+      print('Modelo TFLite cargado correctamente');
     } catch (e) {
-      print('Error capturando imagen: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(this.context).showSnackBar(
-          SnackBar(
-            content: Text('Error al capturar imagen: $e'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isProcessing = false;
-        });
-      }
+      print('Error cargando el modelo TFLite: $e');
     }
   }
 
   Future<void> _processImageForOCR(String imagePath) async {
+    if (_interpreter == null) {
+      print('Intérprete no inicializado');
+      return;
+    }
+
+    setState(() => _isProcessing = true);
+
     try {
-      final File imageFile = File(imagePath);
-      final InputImage inputImage = InputImage.fromFile(imageFile);
+      // Leer y preprocesar la imagen
+      final imageFile = File(imagePath);
+      final imageBytes = await imageFile.readAsBytes();
+      final image = img.decodeImage(imageBytes);
+      if (image == null) throw Exception('No se pudo decodificar la imagen');
 
-      final RecognizedText recognizedText = await _textRecognizer.processImage(
-        inputImage,
-      );
+      // Convertir a escala de grises y redimensionar
+      final grayscale = img.grayscale(image);
+      final resized = img.copyResize(grayscale, width: 64, height: 64);
 
-      String extractedText = '';
-      for (TextBlock block in recognizedText.blocks) {
-        for (TextLine line in block.lines) {
-          extractedText += line.text + '\n';
+      // Convertir a tensor y normalizar (0-255)
+      var inputArray = Float32List(1 * 64 * 64 * 1);
+      var inputIndex = 0;
+      for (var y = 0; y < 64; y++) {
+        for (var x = 0; x < 64; x++) {
+          // Obtener el valor de gris (0-255) y mantenerlo en ese rango
+          inputArray[inputIndex++] = img
+              .getRed(resized.getPixel(x, y))
+              .toDouble();
         }
       }
 
-      if (mounted) {
-        setState(() {
-          _extractedText = extractedText.isNotEmpty
-              ? extractedText
-              : 'No se detectó texto en la imagen';
-        });
+      // Preparar el tensor de salida (36 clases)
+      var outputArray = Float32List(1 * 36);
+
+      // Ejecutar la inferencia
+      var inputShape = [1, 64, 64, 1];
+      var outputShape = [1, 36];
+
+      _interpreter!.resizeInputTensor(0, inputShape);
+      _interpreter!.allocateTensors();
+
+      _interpreter!.run(inputArray, outputArray);
+
+      // Encontrar la clase con mayor probabilidad
+      var maxIndex = 0;
+      var maxValue = outputArray[0];
+      for (var i = 1; i < 36; i++) {
+        if (outputArray[i] > maxValue) {
+          maxValue = outputArray[i];
+          maxIndex = i;
+        }
       }
 
-      await _saveProcessedImage(imageFile);
+      // Obtener el carácter reconocido
+      final recognizedChar = ocrClasses[maxIndex];
+
+      // Guardar en el historial
+      final prefs = await SharedPreferences.getInstance();
+      final history = prefs.getStringList('ocr_history') ?? [];
+      history.insert(
+        0,
+        'Carácter reconocido: $recognizedChar (${DateTime.now()})',
+      );
+      await prefs.setStringList('ocr_history', history);
+
+      setState(() {
+        _extractedText = recognizedChar;
+        _isProcessing = false;
+      });
     } catch (e) {
-      print('Error procesando OCR: $e');
-      if (mounted) {
-        setState(() {
-          _extractedText = 'Error al procesar la imagen: $e';
-        });
-      }
+      print('Error en el procesamiento OCR: $e');
+      setState(() {
+        _extractedText = 'Error en el reconocimiento';
+        _isProcessing = false;
+      });
     }
   }
 
-  Future<void> _saveProcessedImage(File imageFile) async {
+  Future<void> _captureAndProcess() async {
+    if (!_isCameraInitialized || _isProcessing) return;
+
     try {
-      final Directory appDir = await getApplicationDocumentsDirectory();
-      final String fileName =
-          'ocr_${DateTime.now().millisecondsSinceEpoch}.jpg';
-      final String savePath = join(appDir.path, fileName);
-
-      await imageFile.copy(savePath);
-      print('Imagen guardada en: $savePath');
-
-      // Guardar el historial de escaneo
-      final prefs = await SharedPreferences.getInstance();
-      final String? historyString = prefs.getString('scan_history');
-      List<Map<String, String>> history = [];
-      if (historyString != null) {
-        history = List<Map<String, String>>.from(
-          json
-              .decode(historyString)
-              .map((item) => Map<String, String>.from(item)),
-        );
-      }
-      history.insert(0, {
-        // Añadir al principio para mostrar lo más reciente primero
-        'text': _extractedText,
-        'timestamp': DateTime.now().toIso8601String(),
-        'imagePath': savePath,
-      });
-      await prefs.setString('scan_history', json.encode(history));
+      final image = await _cameraController!.takePicture();
+      await _processImageForOCR(image.path);
     } catch (e) {
-      print('Error guardando imagen: $e');
+      print('Error capturando imagen: $e');
     }
   }
 
@@ -193,7 +240,7 @@ class _OCRScreenState extends State<OCRScreen> {
   @override
   void dispose() {
     _cameraController?.dispose();
-    _textRecognizer.close();
+    _interpreter?.close();
     super.dispose();
   }
 
@@ -400,7 +447,7 @@ class _OCRScreenState extends State<OCRScreen> {
       // Botón de captura
       floatingActionButton: FloatingActionButton.extended(
         onPressed: _isCameraInitialized && !_isProcessing
-            ? _captureAndProcessImage
+            ? _captureAndProcess
             : null,
         icon: Icon(_isProcessing ? Icons.hourglass_empty : Icons.camera_alt),
         label: Text(_isProcessing ? 'Procesando...' : 'Capturar'),
